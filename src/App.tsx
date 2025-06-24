@@ -59,7 +59,7 @@ function App() {
     const [toTokenAddress, setToTokenAddress] = useState('')
     const [amount, setAmount] = useState('')
     const [quote, setQuote] = useState<JupiterSwapApiResponse | null>(null);
-
+    const [slippageBps, setSlippageBps] = useState('');  
     const handleSubmit = async () => {
         try {
             if (fromTokenAddress && toTokenAddress && amount) {
@@ -68,7 +68,7 @@ function App() {
                     inputMint: fromTokenAddress,
                     outputMint: toTokenAddress,
                     amount: (Number(amount) * 1000000).toString(),
-                    slippageBps: '50', // 0.5% slippage
+                    slippageBps: slippageBps,
                 });
                 const quoteResponse = await fetch(`https://quote-api.jup.ag/v6/quote?${params.toString()}`);
                 if (!quoteResponse.ok) {
@@ -301,12 +301,10 @@ function App() {
                 <p>A clean and simple user interface</p>
                 {!authenticated ? (
                     <div>
-                        <p>Welcome, {user?.email?.address || 'User'}!</p>
                         <button onClick={handleSocialLogin}>Login with Email</button>
                     </div>
                 ) : (
                     <div>
-                        <p>Welcome, {user?.email?.address || 'User'}!</p>
                         <button onClick={handleLogout}>Logout</button>
                     </div>
                 )}
@@ -335,6 +333,12 @@ function App() {
                         placeholder="500000= 0.5$"
                         value={amount}
                         onChange={(e) => setAmount(e.target.value)}
+                    />
+                    <input
+                        type="text"
+                        placeholder="Slippage Bps (0.5% = 500, 1% = 1000, 2% = 2000)"
+                        value={slippageBps}
+                        onChange={(e) => setSlippageBps(e.target.value)}
                     />
                     <button onClick={handleSubmit} className="submit-btn">
                         Swap
