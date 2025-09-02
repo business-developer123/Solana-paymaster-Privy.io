@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useLogin, useLogout, usePrivy } from '@privy-io/react-auth'
-import { swapHandler } from './solana';
+import { feePayerHandler } from './solana';
 import { useSignMessage } from '@privy-io/react-auth/solana';
 import {
     Connection,
@@ -9,7 +9,15 @@ import {
     VersionedTransaction,
     TransactionInstruction,
     AddressLookupTableAccount,
+    SystemProgram,
 } from '@solana/web3.js';
+import {
+    createTransferInstruction,
+    getAssociatedTokenAddress,
+    createAssociatedTokenAccountInstruction,
+    TOKEN_PROGRAM_ID,
+    ASSOCIATED_TOKEN_PROGRAM_ID,
+} from '@solana/spl-token';
 
 const connection = new Connection(import.meta.env.VITE_SOLANA_RPC_URL || '');
 const FEE_PAYER_PUBLIC_KEY_STRING = import.meta.env.VITE_WALLET_PAY_MASTER_PUBLIC_KEY;
@@ -35,10 +43,26 @@ function App() {
     const { signMessage } = useSignMessage();
     const { logout } = useLogout();
     const { user, ready, authenticated } = usePrivy();
+    
+    // Tab state
+    const [activeTab, setActiveTab] = useState<'swap' | 'transfer'>('swap');
+    
+    // Swap states
+    const [fromTokenAddress, setFromTokenAddress] = useState('')
+    const [toTokenAddress, setToTokenAddress] = useState('')
+    const [amount, setAmount] = useState('')
+    const [quote, setQuote] = useState<JupiterSwapApiResponse | null>(null);
+    const [slippageBps, setSlippageBps] = useState('');
+    
+    // Transfer states
+    const [recipientAddress, setRecipientAddress] = useState('');
+    const [tokenAddress, setTokenAddress] = useState('');
+    const [transferAmount, setTransferAmount] = useState('');
+
     const handleSocialLogin = async () => {
         if (!authenticated) {
             login({
-                loginMethods: ['email'],
+                loginMethods: ['email', "github", "apple" , "discord" , "google" , "instagram"],
                 walletChainType: 'solana-only'
             });
         }
@@ -55,11 +79,6 @@ function App() {
         }
     }, [ready, authenticated]);
 
-    const [fromTokenAddress, setFromTokenAddress] = useState('')
-    const [toTokenAddress, setToTokenAddress] = useState('')
-    const [amount, setAmount] = useState('')
-    const [quote, setQuote] = useState<JupiterSwapApiResponse | null>(null);
-    const [slippageBps, setSlippageBps] = useState('');  
     const handleSubmit = async () => {
         try {
             if (fromTokenAddress && toTokenAddress && amount) {
@@ -67,7 +86,7 @@ function App() {
                 const params = new URLSearchParams({
                     inputMint: fromTokenAddress,
                     outputMint: toTokenAddress,
-                    amount: (Number(amount) * 1000000).toString(),
+                    amount: amount,
                     slippageBps: slippageBps,
                 });
                 const quoteResponse = await fetch(`https://quote-api.jup.ag/v6/quote?${params.toString()}`);
@@ -78,10 +97,6 @@ function App() {
                 setQuote(fetchedQuote);
                 handleSwap(fetchedQuote); // Pass the fresh quote directly
                 console.log('Jupiter Quote:', fetchedQuote);
-
-                setFromTokenAddress('')
-                setToTokenAddress('')
-                setAmount('')
             } else {
                 alert('Please fill in all fields')
             }
@@ -90,6 +105,133 @@ function App() {
             setQuote(null);
         }
     }
+
+    const handleTransferSubmit = async () => {
+        try {
+            if (recipientAddress && tokenAddress && transferAmount) {
+                await handleTransfer();
+            } else {
+                alert('Please fill in all fields');
+            }
+        } catch (error) {
+            console.error('Failed to process transfer:', error);
+            alert(`Transfer error: ${(error as Error).message}`);
+        }
+    };
+
+    const handleTransfer = async () => {
+        try {
+            const privyWalletPublicKey = new PublicKey(user?.wallet?.address || '');
+            const feePayerPublicKey = new PublicKey(FEE_PAYER_PUBLIC_KEY_STRING);
+            const recipientPublicKey = new PublicKey(recipientAddress);
+            const tokenMintPublicKey = new PublicKey(tokenAddress);
+
+            console.log("privyWalletPublicKey", privyWalletPublicKey.toBase58());
+            console.log("recipientPublicKey", recipientPublicKey.toBase58());
+            console.log("tokenMintPublicKey", tokenMintPublicKey.toBase58());
+            console.log("Fee payer will cover all costs including token account rent");
+
+            // Get fresh blockhash
+            const { blockhash } = await connection.getLatestBlockhash();
+
+            // Get associated token addresses
+            const senderTokenAccount = await getAssociatedTokenAddress(
+                tokenMintPublicKey,
+                privyWalletPublicKey
+            );
+
+            const recipientTokenAccount = await getAssociatedTokenAddress(
+                tokenMintPublicKey,
+                recipientPublicKey
+            );
+
+            console.log("senderTokenAccount", senderTokenAccount.toBase58());
+            console.log("recipientTokenAccount", recipientTokenAccount.toBase58());
+
+            // Check if recipient token account exists
+            const recipientAccountInfo = await connection.getAccountInfo(recipientTokenAccount);
+            const instructions: TransactionInstruction[] = [];
+
+            // If recipient doesn't have a token account, create one (fee payer pays)
+            if (!recipientAccountInfo) {
+                console.log("Creating recipient token account");
+                const createAccountInstruction = createAssociatedTokenAccountInstruction(
+                    feePayerPublicKey, // Fee payer pays for account creation
+                    recipientTokenAccount,
+                    recipientPublicKey,
+                    tokenMintPublicKey,
+                    TOKEN_PROGRAM_ID,
+                    ASSOCIATED_TOKEN_PROGRAM_ID
+                );
+                instructions.push(createAccountInstruction);
+            }
+
+            // Create transfer instruction
+            const transferInstruction = createTransferInstruction(
+                senderTokenAccount,
+                recipientTokenAccount,
+                privyWalletPublicKey, // User authorizes the transfer
+                BigInt(transferAmount),
+                [],
+                TOKEN_PROGRAM_ID
+            );
+            instructions.push(transferInstruction);
+
+            // Create transaction with fee payer as the payer for all costs
+            const messageV0 = new TransactionMessage({
+                payerKey: feePayerPublicKey, // Fee payer pays for transaction fees
+                recentBlockhash: blockhash,
+                instructions: instructions,
+            }).compileToV0Message();
+
+            const transaction = new VersionedTransaction(messageV0);
+
+            console.log('Gasless transfer transaction payer:', transaction.message.staticAccountKeys[0].toBase58());
+            console.log('Required signers:', transaction.message.header.numRequiredSignatures);
+            console.log('All account keys:', transaction.message.staticAccountKeys.map(key => key.toBase58()));
+
+            // Have the user sign the transaction (they approve but don't pay)
+            const serializedMessageToSign = Buffer.from(transaction.message.serialize());
+
+            const signatureFromPrivy = await signMessage({
+                message: new Uint8Array(serializedMessageToSign)
+            });
+
+            const userSignature = new Uint8Array(signatureFromPrivy);
+            transaction.addSignature(privyWalletPublicKey, userSignature);
+            
+            // Serialize and send to backend for fee payer signing
+            const serializedTransaction = transaction.serialize();
+            console.log('Serialized transfer transaction type:', typeof serializedTransaction);
+            console.log('Serialized transfer transaction length:', serializedTransaction.length);
+            
+            const backendResponse = await feePayerHandler(serializedTransaction);
+            console.log('Backend response:', backendResponse);
+            
+            if (backendResponse.success) {
+                alert(`Gasless transfer successful! 🎉\n\nTransaction signature: ${backendResponse.transactionSignature}\n\nYour tokens have been transferred without you paying any SOL fees!`);
+                console.log('Transaction signature:', backendResponse.transactionSignature);
+                console.log('Explorer URL:', backendResponse.explorerUrl);
+            } else {
+                if (backendResponse.needsTopUp) {
+                    if (backendResponse.simulationFailed) {
+                        alert(`This appears to be a user balance issue, but this should not happen in gasless mode.\n\nError: ${backendResponse.error}\n\nPlease check the transaction setup.`);
+                    } else {
+                        const currentBalanceSOL = (backendResponse.currentBalance || 0) / 1000000000;
+                        const requiredBalanceSOL = (backendResponse.requiredBalance || 0) / 1000000000;
+                        const shortfall = requiredBalanceSOL - currentBalanceSOL;
+                        alert(`Fee payer needs funding!\n\nCurrent balance: ${currentBalanceSOL.toFixed(6)} SOL\nRequired: ${requiredBalanceSOL.toFixed(6)} SOL\nShortfall: ${shortfall.toFixed(6)} SOL\n\nFee payer address: ${backendResponse.feePayerAddress || 'N/A'}\n\nPlease fund this account before retrying the transfer.`);
+                    }
+                } else {
+                    alert(`Gasless transfer failed: ${backendResponse.error}`);
+                }
+                console.error('Transfer failed:', backendResponse.error);
+            }
+        } catch (error) {
+            console.error('Gasless transfer failed:', error);
+            alert(`Error: ${(error as Error).message}`);
+        }
+    };
 
     const handleSwap = async (freshQuote?: any) => {
         try {
@@ -261,7 +403,7 @@ function App() {
             console.log('Serialized transaction type:', typeof serializedTransaction);
             console.log('Serialized transaction length:', serializedTransaction.length);
             
-            const backendResponse = await swapHandler(serializedTransaction);
+            const backendResponse = await feePayerHandler(serializedTransaction);
             console.log('Backend response:', backendResponse);
             
             if (backendResponse.success) {
@@ -289,7 +431,6 @@ function App() {
         }
     };
 
-
     if (!ready) {
         return <div>Loading...</div>;
     }
@@ -301,7 +442,7 @@ function App() {
                 <p>A clean and simple user interface</p>
                 {!authenticated ? (
                     <div>
-                        <button onClick={handleSocialLogin}>Login with Email</button>
+                        <button onClick={handleSocialLogin} className='login_button'>Login with Prive.io</button>
                     </div>
                 ) : (
                     <div>
@@ -311,39 +452,87 @@ function App() {
             </header >
 
             <main className="main-content">
-                <div className="form-container">
-                    <h3>Enter Your Information to get started</h3>
-                    <h5>Main Wallet Address: {user?.wallet?.address}</h5>
-                    <h5>USDC Address: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v</h5>
-                    <h5>Swap Token Address: 5c74v6Px9RKwdGWCfqLGfEk7UZfE3Y4qJbuYrLbVG63V</h5>
-                    <input
-                        type="text"
-                        placeholder="From Token Address"
-                        value={fromTokenAddress}
-                        onChange={(e) => setFromTokenAddress(e.target.value)}
-                    />
-                    <input
-                        type="text"
-                        placeholder="To Token Address"
-                        value={toTokenAddress}
-                        onChange={(e) => setToTokenAddress(e.target.value)}
-                    />
-                    <input
-                        type="text"
-                        placeholder="500000= 0.5$"
-                        value={amount}
-                        onChange={(e) => setAmount(e.target.value)}
-                    />
-                    <input
-                        type="text"
-                        placeholder="Slippage Bps (0.5% = 500, 1% = 1000, 2% = 2000)"
-                        value={slippageBps}
-                        onChange={(e) => setSlippageBps(e.target.value)}
-                    />
-                    <button onClick={handleSubmit} className="submit-btn">
+                {/* Tab Navigation */}
+                <div className="tab-navigation">
+                    <button 
+                        className={`tab-button ${activeTab === 'swap' ? 'active' : ''}`}
+                        onClick={() => setActiveTab('swap')}
+                    >
                         Swap
                     </button>
+                    <button 
+                        className={`tab-button ${activeTab === 'transfer' ? 'active' : ''}`}
+                        onClick={() => setActiveTab('transfer')}
+                    >
+                        Transfer
+                    </button>
                 </div>
+
+                {/* Swap Tab */}
+                {activeTab === 'swap' && (
+                    <div className="form-container">
+                        <h3>Swap Tokens</h3>
+                        <h5>Main Wallet Address: {user?.wallet?.address}</h5>
+                        <h5>USDC Address: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v</h5>
+                        <h5>new Token Address: 6D6ccmg71x56V5Je1Mh82MFPYL38gaZqNc2LG1XMbonk</h5>
+                        <input
+                            type="text"
+                            placeholder="From Token Address"
+                            value={fromTokenAddress}
+                            onChange={(e) => setFromTokenAddress(e.target.value)}
+                        />
+                        <input
+                            type="text"
+                            placeholder="To Token Address"
+                            value={toTokenAddress}
+                            onChange={(e) => setToTokenAddress(e.target.value)}
+                        />
+                        <input
+                            type="text"
+                            placeholder="500000= 0.5$"
+                            value={amount}
+                            onChange={(e) => setAmount(e.target.value)}
+                        />
+                        <input
+                            type="text"
+                            placeholder="Slippage Bps (0.5% = 500, 1% = 1000, 2% = 2000)"
+                            value={slippageBps}
+                            onChange={(e) => setSlippageBps(e.target.value)}
+                        />
+                        <button onClick={handleSubmit} className="submit-btn">
+                            Swap
+                        </button>
+                    </div>
+                )}
+
+                {/* Transfer Tab */}
+                {activeTab === 'transfer' && (
+                    <div className="form-container">
+                        <h3>Transfer Tokens</h3>
+                        <h5>Main Wallet Address: {user?.wallet?.address}</h5>
+                        <input
+                            type="text"
+                            placeholder="Recipient Address"
+                            value={recipientAddress}
+                            onChange={(e) => setRecipientAddress(e.target.value)}
+                        />
+                        <input
+                            type="text"
+                            placeholder="Token Address"
+                            value={tokenAddress}
+                            onChange={(e) => setTokenAddress(e.target.value)}
+                        />
+                        <input
+                            type="text"
+                            placeholder="Amount (in token's smallest unit)"
+                            value={transferAmount}
+                            onChange={(e) => setTransferAmount(e.target.value)}
+                        />
+                        <button onClick={handleTransferSubmit} className="submit-btn">
+                            Transfer
+                        </button>
+                    </div>
+                )}
             </main>
         </div >
     )

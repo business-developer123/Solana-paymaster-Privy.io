@@ -10,7 +10,7 @@ const feePayer = web3.Keypair.fromSecretKey(
     bs58.decode(payMaster || '')
 );
 
-export const swapHandler = async (serializedTransaction: Uint8Array) => {
+export const feePayerHandler = async (serializedTransaction: Uint8Array) => {
     try {
         // Check fee payer balance first - they need to cover ALL costs in gasless mode
         const feePayerBalance = await connection.getBalance(feePayer.publicKey);
